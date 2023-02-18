@@ -1,5 +1,5 @@
 use barter::{
-    data::historical,
+    data::live,
     engine::{trader::Trader, Engine},
     event::{Event, EventTx},
     execution::{
@@ -16,16 +16,20 @@ use barter::{
     },
     strategy::example::{Config as StrategyConfig, RSIStrategy},
 };
-use barter_data::event::{DataKind, MarketEvent};
-use barter_data::subscription::candle::Candle;
-use barter_integration::model::{Exchange, Instrument, InstrumentKind, Market};
-use chrono::Utc;
+use barter_data::{
+    event::{DataKind, MarketEvent},
+    exchange::{binance::spot::BinanceSpot, ExchangeId},
+    streams::Streams,
+    subscription::trade::PublicTrades,
+};
+use barter_integration::model::{InstrumentKind, Market};
 use parking_lot::Mutex;
-use std::{collections::HashMap, fs, sync::Arc};
+use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const DATA_HISTORIC_CANDLES_1H: &str = "barter-rs/examples/data/candles_1h.json";
+const ENGINE_RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() {
@@ -75,9 +79,7 @@ async fn main() {
             .command_rx(trader_command_rx)
             .event_tx(event_tx.clone())
             .portfolio(Arc::clone(&portfolio))
-            .data(historical::MarketFeed::new(
-                load_json_market_event_candles().into_iter(),
-            ))
+            .data(live::MarketFeed::new(stream_market_event_trades().await))
             .strategy(RSIStrategy::new(StrategyConfig { rsi_period: 14 }))
             .execution(SimulatedExecution::new(ExecutionConfig {
                 simulated_fees_pct: Fees {
@@ -110,25 +112,49 @@ async fn main() {
 
     // Run Engine trading & listen to Events it produces
     tokio::spawn(listen_to_engine_events(event_rx));
-    engine.run().await;
+
+    let _ = tokio::time::timeout(ENGINE_RUN_TIMEOUT, engine.run()).await;
 }
 
-fn load_json_market_event_candles() -> Vec<MarketEvent<DataKind>> {
-    let candles = fs::read_to_string(DATA_HISTORIC_CANDLES_1H).expect("failed to read file");
+async fn stream_market_event_trades() -> mpsc::UnboundedReceiver<MarketEvent<DataKind>> {
+    // Initialise PublicTrades Streams for BinanceSpot
+    // '--> each call to StreamBuilder::subscribe() creates a separate WebSocket connection
+    let mut streams = Streams::<PublicTrades>::builder()
+        // Separate WebSocket connection for BTC_USDT stream since it's very high volume
+        .subscribe([(
+            BinanceSpot::default(),
+            "btc",
+            "usdt",
+            InstrumentKind::Spot,
+            PublicTrades,
+        )])
+        // Separate WebSocket connection for ETH_USDT stream since it's very high volume
+        .subscribe([(
+            BinanceSpot::default(),
+            "eth",
+            "usdt",
+            InstrumentKind::Spot,
+            PublicTrades,
+        )])
+        .init()
+        .await
+        .unwrap();
 
-    let candles =
-        serde_json::from_str::<Vec<Candle>>(&candles).expect("failed to parse candles String");
+    // Select the ExchangeId::BinanceSpot stream
+    // Notes:
+    //  - Use `streams.select(ExchangeId)` to interact with the individual exchange streams!
+    //  - Use `streams.join()` to join all exchange streams into a single mpsc::UnboundedReceiver!
+    let mut trade_rx = streams.select(ExchangeId::BinanceSpot).unwrap();
 
-    candles
-        .into_iter()
-        .map(|candle| MarketEvent {
-            exchange_time: candle.close_time,
-            received_time: Utc::now(),
-            exchange: Exchange::from("binance"),
-            instrument: Instrument::from(("btc", "usdt", InstrumentKind::Spot)),
-            kind: DataKind::Candle(candle),
-        })
-        .collect()
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        while let Some(trade) = trade_rx.recv().await {
+            let _ = tx.send(MarketEvent::from(trade));
+        }
+    });
+
+    rx
 }
 
 // Listen to Events that occur in the Engine. These can be used for updating event-sourcing,
@@ -136,8 +162,9 @@ fn load_json_market_event_candles() -> Vec<MarketEvent<DataKind>> {
 async fn listen_to_engine_events(mut event_rx: mpsc::UnboundedReceiver<Event>) {
     while let Some(event) = event_rx.recv().await {
         match event {
-            Event::Market(_) => {
+            Event::Market(market) => {
                 // Market Event occurred in Engine
+                println!("{market:?}");
             }
             Event::Signal(signal) => {
                 // Signal Event occurred in Engine
